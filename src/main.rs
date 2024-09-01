@@ -16,18 +16,14 @@ fn main() -> Result<()> {
     match command.as_str() {
         ".dbinfo" => {
             let mut file = File::open(&args[1])?;
+            // The first 100 bytes of the database file comprise the database file header.
             let mut header = [0; 100];
             file.read_exact(&mut header)?;
 
             // The page size is stored at the 16th byte offset, using 2 bytes in big-endian order
-            #[allow(unused_variables)]
             let page_size = u16::from_be_bytes([header[16], header[17]]);
 
-            // You can use print statements as follows for debugging, they'll be visible when running tests.
-            println!("Logs from your program will appear here!");
-
-            // Uncomment this block to pass the first stage
-            // println!("database page size: {}", page_size);
+            println!("database page size: {}", page_size);
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
