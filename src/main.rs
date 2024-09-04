@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+
 use std::fs::File;
 use std::io::prelude::*;
 
@@ -22,6 +23,11 @@ fn main() -> Result<()> {
             let mut file_header = [0; 100];
             file.read_exact(&mut file_header)?;
 
+            anyhow::ensure!(
+                file_header.starts_with(b"SQLite format 3"),
+                "Incorrect database format"
+            );
+
             // The page size is stored at the 16th byte offset, using 2 bytes in big-endian order
             let page_size = u16::from_be_bytes([file_header[16], file_header[17]]);
             println!("database page size: {}", page_size);
@@ -44,8 +50,9 @@ fn main() -> Result<()> {
             // So, each row in sqlite_schema represents a table in the database.
             // As a result, you can get the total number of tables in the database by getting the number of rows in sqlite_schema.
             // The sqlite_schema page stores the rows of the sqlite_schema table in chunks of data called "cells." Each cell stores a single row.
-            let ncells = u16::from_be_bytes([page_header[3], page_header[4]]);
-            println!("number of tables: {}", ncells);
+            // The two-byte integer at offset 3 gives the number of cells on the page.
+            let n_cells = u16::from_be_bytes([page_header[3], page_header[4]]);
+            println!("number of tables: {}", n_cells);
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
