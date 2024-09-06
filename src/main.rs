@@ -38,6 +38,13 @@ fn main() -> Result<()> {
             }
             println!();
         }
+        ".schema" => {
+            let db = DB::new(&args[1]).context("open DB")?;
+
+            for sql in db.schemas() {
+                println!("{};", sql);
+            }
+        }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
 

@@ -80,4 +80,8 @@ impl DB {
             .map(|&s| s.tbl_name.clone())
             .collect()
     }
+
+    pub fn schemas(&self) -> Vec<String> {
+        self.db_info.schemas.iter().map(|s| s.sql.clone()).collect()
+    }
 }
