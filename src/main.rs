@@ -41,11 +41,23 @@ fn main() -> Result<()> {
         ".schema" => {
             let db = DB::new(&args[1]).context("open DB")?;
 
-            for sql in db.schemas() {
+            for sql in db.schemas_sql() {
                 println!("{};", sql);
             }
         }
-        _ => bail!("Missing or invalid command passed: {}", command),
+        cmd => {
+            let sql = cmd.trim();
+            if sql.to_uppercase().starts_with(".") {
+                bail!("Invalid command: {}!", sql);
+            }
+            if !sql.to_uppercase().starts_with("SELECT") {
+                bail!("Invalid SQL command: {}; only SELECT is supported!", sql);
+            }
+
+            let db = DB::new(&args[1]).context("open DB")?;
+            let res = db.execute(sql)?;
+            println!("{}", res);
+        }
     }
 
     Ok(())

@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Schema {
     /*
     CREATE TABLE sqlite_schema(

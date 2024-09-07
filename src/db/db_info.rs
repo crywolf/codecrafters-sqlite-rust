@@ -66,7 +66,9 @@ impl DBInfo {
 
         // In this challenge, you can assume that the sqlite_schema table is small enough to fit entirely on a single page.
         let mut page_header = [0; 8];
-        db_file.read_exact(&mut page_header)?;
+        db_file
+            .read_exact(&mut page_header)
+            .context("read page header (8 bytes)")?;
 
         let page_type = page_header[0];
         anyhow::ensure!(
