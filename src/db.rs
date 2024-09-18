@@ -3,13 +3,18 @@ mod page;
 mod schema;
 mod sql;
 
-use std::fs::File;
 use std::path::Path;
+use std::{
+    fs::File,
+    io::{Seek, SeekFrom},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use db_info::DBInfo;
+use page::Page;
 use schema::{Schema, SchemaType};
+use sql::Command;
 
 #[derive(Debug)]
 pub struct DB {
@@ -85,19 +90,65 @@ impl DB {
         self.db_info.schemas.iter().map(|s| s.sql.clone()).collect()
     }
 
+    pub fn execute(&mut self, sql: &str) -> Result<Vec<Vec<String>>> {
+        let cmd = sql::parse_command(sql)?;
+        let res = cmd.execute(self)?;
+        Ok(res)
+    }
+
+    pub(crate) fn get_page(&mut self, table: &str) -> Result<Page> {
+        let schema = self
+            .schema(table)
+            .ok_or_else(|| anyhow::anyhow!("No schema found for {}", table))?;
+
+        let cmd = sql::parse_command(&schema.sql).context("get primary key column")?;
+
+        let primary_key_column = if let Command::Create { primary_key, .. } = cmd {
+            primary_key
+        } else {
+            bail!("Failed to get primary key")
+        };
+
+        let table_columns = self
+            .table_columns(table)
+            .with_context(|| format!("get schema columns for table {}", table))?;
+
+        let page_start = (schema.rootpage - 1) * self.page_size() as u64;
+
+        self.file
+            .seek(SeekFrom::Start(page_start))
+            .context("seek offset in the DB file")?;
+
+        Page::new(
+            self.file.try_clone()?,
+            self.page_size(),
+            table_columns,
+            primary_key_column,
+        )
+    }
+
+    pub(crate) fn table_columns(&self, tbl_name: &str) -> Result<Vec<String>> {
+        /* To extract data for a single column, you'll need to know the order of that column in the sequence.
+        You'll need to parse the table's CREATE TABLE statement to do this. */
+        let schema = self
+            .schema(tbl_name)
+            .ok_or(anyhow!("table {} does not exist", tbl_name))?;
+
+        let cmd = sql::parse_command(&schema.sql).context("parse schema")?;
+
+        let columns = match cmd {
+            sql::Command::Create { columns, .. } => columns,
+            _ => bail!("Schema is broken"),
+        };
+
+        Ok(columns)
+    }
+
     pub(crate) fn schema(&self, tbl_name: &str) -> Option<Schema> {
         self.db_info
             .schemas
             .iter()
             .find(|&s| s.tbl_name == tbl_name)
             .cloned()
-    }
-
-    pub fn execute(&self, sql: &str) -> Result<String> {
-        let cmd = sql::parse(sql)?;
-
-        let res = cmd.execute(self)?;
-
-        Ok(res)
     }
 }

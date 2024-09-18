@@ -38,37 +38,46 @@ impl SchemaType {
     }
 }
 
-pub(crate) fn column_type<T>(mut v: T) -> Result<(String, u64)>
+#[derive(Debug)]
+pub(crate) enum ColumnType {
+    Text(u64),
+    Int(u64),
+    Blob(u64),
+    Float(u64),
+    Null(u64),
+}
+
+pub(crate) fn column_type<T>(mut v: T) -> Result<ColumnType>
 where
     T: bytes::Buf + std::fmt::Debug,
 {
-    let v = varint(&mut v).with_context(|| format!("get int from varint {:?}", v))?;
-    let (col_type, len) = if v > 12 {
+    let v = varint(&mut v).with_context(|| format!("get int from varint {:?}", v))? as u64;
+    let column_type = if v > 12 {
         if v % 2 == 0 {
-            ("blob", (v - 12) / 2) // BLOB: v = (n*2) + 12 => n = (v - 12) / 2
+            ColumnType::Blob((v - 12) / 2) // BLOB: v = (n*2) + 12 => n = (v - 12) / 2
         } else {
-            ("text", (v - 13) / 2) // TEXT: v = (n*2) + 13 => n = (v - 13) / 2
+            ColumnType::Text((v - 13) / 2) // TEXT: v = (n*2) + 13 => n = (v - 13) / 2
         }
     } else if v < 7 {
         if v == 5 {
-            ("int", 6)
+            ColumnType::Int(6)
         } else if v == 6 {
-            ("int", 8)
+            ColumnType::Int(8)
         } else {
-            ("int", v)
+            ColumnType::Int(v)
         }
     } else if v == 7 {
-        ("float", 1)
+        ColumnType::Float(1)
     } else if v == 0 {
-        ("null", 0)
+        ColumnType::Null(0)
     } else {
         bail!("invalid column serial type: {}", v)
     };
 
-    Ok((col_type.to_string(), len))
+    Ok(column_type)
 }
 
-fn varint<T>(mut buf: T) -> Result<u64>
+pub(crate) fn varint<T>(mut buf: T) -> Result<i64>
 where
     T: bytes::Buf,
 {
@@ -78,7 +87,7 @@ where
 
     let buf_len = buf.remaining();
 
-    let mut b0 = buf.get_u8() as u64;
+    let mut b0 = buf.get_u8() as i64;
     let mut res = b0 & 0b0111_1111;
     let mut n_bytes = 1;
 
@@ -92,7 +101,7 @@ where
             bail!("buffer is too short ({} bytes) or invalid varint", buf_len)
         }
 
-        let b1 = buf.get_u8() as u64;
+        let b1 = buf.get_u8() as i64;
         if buf.remaining() == 0 && b1 & 0b1000_0000 != 0 {
             // last byte still starts with 1
 

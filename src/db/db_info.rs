@@ -1,9 +1,10 @@
-use anyhow::{Context, Result};
-use bytes::{BufMut, Bytes, BytesMut};
+use anyhow::{bail, Context, Result};
+use bytes::{Bytes, BytesMut};
 
 use std::io::prelude::*;
 
 use super::schema::{Schema, SchemaType};
+use crate::db::schema::{varint, ColumnType};
 
 #[derive(Debug)]
 pub(crate) struct DBInfo {
@@ -105,16 +106,23 @@ impl DBInfo {
                 u16::from_be_bytes([cell_pointers[i_cell * 2], cell_pointers[i_cell * 2 + 1]]);
 
             let cell_size = (previous_offset - offset) as usize;
-            let mut cell = BytesMut::with_capacity(cell_size);
-            cell.put_bytes(0, cell_size);
+            let mut cell = BytesMut::zeroed(cell_size);
 
             db_file.read_exact_at(&mut cell, offset as u64)?;
 
-            let _payload_size = cell[0]; // Size of the record
-            let _row_id = cell[1]; // rowid
-            let header_size = cell[2]; // Size of record header (varint)
+            // Size of the record (varint)
+            let _payload_size =
+                varint(&mut cell).with_context(|| format!("get int from varint {:?}", cell))?;
 
-            let mut record_header = Bytes::copy_from_slice(&cell[3..3 + header_size as usize - 1]); // minus first byte (it is the header size)
+            // rowid (varint)
+            let _row_id =
+                varint(&mut cell).with_context(|| format!("get int from varint {:?}", cell))?;
+
+            // Size of the record header (varint)
+            let header_size =
+                varint(&mut cell).with_context(|| format!("get int from varint {:?}", cell))?;
+
+            let mut record_header = Bytes::copy_from_slice(&cell[..header_size as usize - 1]); // minus first byte (as it is the header size)
 
             let mut schema = Schema::default();
 
@@ -123,20 +131,31 @@ impl DBInfo {
             while !record_header.is_empty() {
                 anyhow::ensure!(col_i < 6, "schema definition can have only 5 colums");
 
-                let (col_type, val_len) =
+                let column_type =
                     super::schema::column_type(&mut record_header).context("get column type")?;
+
                 let mut s = String::new();
                 let mut num: u64 = 0;
-                if col_type == "int" {
-                    // rootpage integer
-                    num = cell[2 + header_size as usize + previous_len..][..val_len as usize][0]
-                        as u64;
-                } else {
-                    s = String::from_utf8(
-                        cell[2 + header_size as usize + previous_len..][..val_len as usize]
-                            .to_vec(),
-                    )?;
-                }
+
+                let val_len = match column_type {
+                    ColumnType::Int(val_len) => {
+                        let bytes_slice =
+                            &cell[header_size as usize - 1 + previous_len..][..val_len as usize];
+                        let mut bytes = [0; 8];
+                        bytes[8 - (val_len as usize)..].copy_from_slice(bytes_slice);
+                        num = u64::from_be_bytes(bytes);
+                        val_len
+                    }
+                    ColumnType::Text(val_len) => {
+                        s = String::from_utf8(
+                            cell[header_size as usize - 1 + previous_len..][..val_len as usize]
+                                .to_vec(),
+                        )?;
+                        val_len
+                    }
+                    _ => bail!("Invalid column type in schema definition"),
+                };
+
                 previous_len += val_len as usize;
 
                 match col_i {

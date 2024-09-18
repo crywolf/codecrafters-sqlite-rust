@@ -54,9 +54,19 @@ fn main() -> Result<()> {
                 bail!("Invalid SQL command: {}; only SELECT is supported!", sql);
             }
 
-            let db = DB::new(&args[1]).context("open DB")?;
-            let res = db.execute(sql)?;
-            println!("{}", res);
+            let mut db = DB::new(&args[1]).context("open DB")?;
+            let rows = db.execute(sql)?;
+
+            for row in rows {
+                let n_columns = row.len();
+                for (col_i, column) in row.iter().enumerate() {
+                    print!("{}", column);
+                    if col_i < n_columns - 1 {
+                        print!("|");
+                    }
+                }
+                println!();
+            }
         }
     }
 
