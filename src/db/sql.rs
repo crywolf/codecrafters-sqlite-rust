@@ -1,6 +1,6 @@
 mod parser;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use nom::branch::alt;
 
 use crate::db::page::Page;
@@ -14,24 +14,26 @@ pub(crate) fn parse_command(sql: &str) -> Result<Command> {
         Err(err) => bail!("Error parsing SQL: {:?}", err),
     };
 
-    if let ParsedCommand::Create(primary_key) = parsed.command {
-        return Ok(Command::Create {
-            columns: parsed.columns,
-            table: parsed.table,
-            primary_key,
-        });
-    }
+    let columns = parsed.columns;
+    let table = parsed.table;
 
-    if parsed.columns.contains(&"count(*)".to_string()) {
-        return Ok(Command::Count {
-            table: parsed.table,
-        });
-    }
+    let command = match parsed.command {
+        ParsedCommand::Count => Command::Count {
+            table,
+            column: columns
+                .first()
+                .ok_or(anyhow!("Count command is missing column field"))?
+                .to_string(),
+        },
+        ParsedCommand::Select => Command::Select { columns, table },
+        ParsedCommand::Create(pk) => Command::Create {
+            columns,
+            table,
+            primary_key: pk,
+        },
+    };
 
-    Ok(Command::Select {
-        columns: parsed.columns,
-        table: parsed.table,
-    })
+    Ok(command)
 }
 
 #[derive(Debug, PartialEq)]
@@ -39,13 +41,15 @@ pub(crate) enum Command {
     Create {
         columns: Vec<String>,
         table: String,
-        primary_key: u16, // primary key column index
+        /// primary key column index
+        primary_key: u16,
     },
     Select {
         columns: Vec<String>,
         table: String,
     },
     Count {
+        column: String,
         table: String,
     },
 }
@@ -54,7 +58,7 @@ impl Command {
     pub fn table(&self) -> &str {
         match &self {
             Command::Select { table, .. } => table,
-            Command::Count { table } => table,
+            Command::Count { table, .. } => table,
             Command::Create { table, .. } => table,
         }
     }
@@ -74,16 +78,28 @@ impl Command {
     fn select_columns(mut page: Page, column_names: &[String]) -> Result<Vec<Vec<String>>> {
         // SELECT name FROM apples"
         // SELECT id, name FROM apples"
+        // SELECT * FROM apples"
 
         let mut col_indices = Vec::new();
 
-        for col in column_names {
-            let Some(col_index) = page.table_columns.iter().position(|c| c == col) else {
-                bail!("Error: column '{col}' is not in the table")
-            };
-            col_indices.push(col_index as u16);
+        if column_names.len() == 1 && column_names.contains(&"*".to_string()) {
+            // SELECT * FROM ..."
+            col_indices = page
+                .table_columns
+                .iter()
+                .enumerate()
+                .map(|(i, _)| i as u16)
+                .collect();
+            dbg!(column_names);
+        } else {
+            // Selsect specified columns
+            for col in column_names {
+                let Some(col_index) = page.table_columns.iter().position(|c| c == col) else {
+                    bail!("Error: column '{col}' is not in the table")
+                };
+                col_indices.push(col_index as u16);
+            }
         }
-
         let mut result = Vec::new();
 
         for c in page.cells.iter_mut() {
@@ -109,38 +125,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_count_uppercase() {
+    fn test_parse_count_uppercase() {
         let sql = "SELECT COUNT(*) FROM oranges";
         let c = parse_command(sql);
-        assert!(c.is_ok());
         let c = c.unwrap();
         assert_eq!(
             c,
             Command::Count {
+                column: "*".to_string(),
                 table: "oranges".to_string()
             }
         );
     }
 
     #[test]
-    fn parse_count_lowercase() {
+    fn test_parse_count_lowercase() {
         let sql = "select count(*) from oranges";
         let c = parse_command(sql);
-        assert!(c.is_ok());
         let c = c.unwrap();
         assert_eq!(
             c,
             Command::Count {
+                column: "*".to_string(),
                 table: "oranges".to_string()
             }
         );
     }
 
     #[test]
-    fn parse_select_column_uppercase() {
+    fn test_parse_count_column() {
+        let sql = "select count(name) from oranges";
+        let c = parse_command(sql);
+        let c = c.unwrap();
+        assert_eq!(
+            c,
+            Command::Count {
+                column: "name".to_string(),
+                table: "oranges".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_select_column_uppercase() {
         let sql = "SELECT NAME FROM ORANGES";
         let c = parse_command(sql);
-        assert!(c.is_ok());
         let c = c.unwrap();
         assert_eq!(
             c,
@@ -152,15 +181,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_select_column_lowercase() {
+    fn test_parse_select_column_lowercase() {
         let sql = "select name, color from apples";
         let c = parse_command(sql);
-        assert!(c.is_ok());
         let c = c.unwrap();
         assert_eq!(
             c,
             Command::Select {
                 columns: vec!["name".to_string(), "color".to_string()],
+                table: "apples".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_select_column_asterix() {
+        let sql = "select * from apples";
+        let c = parse_command(sql);
+        let c = c.unwrap();
+        assert_eq!(
+            c,
+            Command::Select {
+                columns: vec!["*".to_string()],
                 table: "apples".to_string()
             }
         );

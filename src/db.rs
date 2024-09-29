@@ -14,7 +14,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use db_info::DBInfo;
 use page::Page;
 use schema::{Schema, SchemaType};
-use sql::Command;
 
 #[derive(Debug)]
 pub struct DB {
@@ -101,15 +100,7 @@ impl DB {
             .schema(table)
             .ok_or_else(|| anyhow::anyhow!("No schema found for {}", table))?;
 
-        let cmd = sql::parse_command(&schema.sql).context("get primary key column")?;
-
-        let primary_key_column = if let Command::Create { primary_key, .. } = cmd {
-            primary_key
-        } else {
-            bail!("Failed to get primary key")
-        };
-
-        let table_columns = self
+        let (table_columns, primary_key_column) = self
             .table_columns(table)
             .with_context(|| format!("get schema columns for table {}", table))?;
 
@@ -127,7 +118,7 @@ impl DB {
         )
     }
 
-    pub(crate) fn table_columns(&self, tbl_name: &str) -> Result<Vec<String>> {
+    pub(crate) fn table_columns(&self, tbl_name: &str) -> Result<(Vec<String>, u16)> {
         /* To extract data for a single column, you'll need to know the order of that column in the sequence.
         You'll need to parse the table's CREATE TABLE statement to do this. */
         let schema = self
@@ -135,13 +126,16 @@ impl DB {
             .ok_or(anyhow!("table {} does not exist", tbl_name))?;
 
         let cmd = sql::parse_command(&schema.sql).context("parse schema")?;
-
-        let columns = match cmd {
-            sql::Command::Create { columns, .. } => columns,
+        let (columns, primary_key_column) = match cmd {
+            sql::Command::Create {
+                columns,
+                primary_key,
+                ..
+            } => (columns, primary_key),
             _ => bail!("Schema is broken"),
         };
 
-        Ok(columns)
+        Ok((columns, primary_key_column))
     }
 
     pub(crate) fn schema(&self, tbl_name: &str) -> Option<Schema> {

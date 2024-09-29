@@ -10,6 +10,7 @@ use nom::{
 
 #[derive(Debug, PartialEq)]
 pub enum ParsedCommand {
+    Count,
     Select,
     Create(u16), // parameter is primary key column index
 }
@@ -33,13 +34,16 @@ pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
         )),
     ))(rem)?;
 
-    let col_str;
+    let mut command = ParsedCommand::Select;
 
     let (rem, columns) = if let Some(column) = count {
-        col_str = format!("count({})", column);
-        (rem, vec![col_str.as_str()])
+        command = ParsedCommand::Count;
+        (rem, vec![column])
     } else {
-        separated_list0(tuple((space0, tag(","), space0)), parse_field)(rem)?
+        alt((
+            many1(tag("*")),
+            separated_list0(tuple((space0, tag(","), space0)), parse_field),
+        ))(rem)?
     };
 
     let columns = columns.into_iter().map(|c| c.to_lowercase()).collect();
@@ -52,7 +56,7 @@ pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
     Ok((
         rem,
         Parsed {
-            command: ParsedCommand::Select,
+            command,
             columns,
             table: table.to_lowercase(),
         },
@@ -168,8 +172,8 @@ mod tests {
         assert_eq!(
             c.1,
             Parsed {
-                command: ParsedCommand::Select,
-                columns: vec!["count(*)".to_string()],
+                command: ParsedCommand::Count,
+                columns: vec!["*".to_string()],
                 table: "oranges".to_string(),
             }
         );
@@ -183,8 +187,8 @@ mod tests {
         assert_eq!(
             c.1,
             Parsed {
-                command: ParsedCommand::Select,
-                columns: vec!["count(name)".to_string()],
+                command: ParsedCommand::Count,
+                columns: vec!["name".to_string()],
                 table: "oranges".to_string(),
             }
         );
@@ -215,6 +219,21 @@ mod tests {
             Parsed {
                 command: ParsedCommand::Select,
                 columns: vec!["id".to_string(), "name".to_string(), "descr".to_string()],
+                table: "oranges".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_sql_select_asterix() {
+        let sql = "SELECT * FROM oranges";
+        let c = parse_select(sql);
+        let c = c.unwrap();
+        assert_eq!(
+            c.1,
+            Parsed {
+                command: ParsedCommand::Select,
+                columns: vec!["*".to_string()],
                 table: "oranges".to_string(),
             }
         );
