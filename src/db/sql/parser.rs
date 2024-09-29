@@ -1,7 +1,7 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag, tag_no_case},
-    character::complete::{alpha1, multispace0, multispace1, space0, space1},
+    bytes::complete::{tag, tag_no_case, take_while1},
+    character::complete::{char, multispace0, multispace1, space0, space1},
     combinator::opt,
     multi::{many1, separated_list0},
     sequence::{delimited, preceded, terminated, tuple},
@@ -28,7 +28,7 @@ pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
     let (rem, count) = opt(preceded(
         tag_no_case("COUNT"),
         alt((
-            delimited(tag("("), alpha1, tag(")")),
+            delimited(tag("("), parse_field, tag(")")),
             delimited(tag("("), tag("*"), tag(")")),
         )),
     ))(rem)?;
@@ -39,7 +39,7 @@ pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
         col_str = format!("count({})", column);
         (rem, vec![col_str.as_str()])
     } else {
-        separated_list0(tuple((space0, tag(","), space0)), alpha1)(rem)?
+        separated_list0(tuple((space0, tag(","), space0)), parse_field)(rem)?
     };
 
     let columns = columns.into_iter().map(|c| c.to_lowercase()).collect();
@@ -47,7 +47,7 @@ pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
     let (rem, _) = space1(rem)?;
     let (rem, _) = tag_no_case("FROM")(rem)?;
     let (rem, _) = space1(rem)?;
-    let (rem, table) = terminated(alpha1, space0)(rem)?;
+    let (rem, table) = terminated(parse_field, space0)(rem)?;
 
     Ok((
         rem,
@@ -57,30 +57,6 @@ pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
             table: table.to_lowercase(),
         },
     ))
-}
-
-fn parse_column_name(input: &str) -> IResult<&str, (&str, bool)> {
-    let (rem, v) = terminated(
-        many1(tuple((multispace0, alpha1, space0))),
-        alt((tag(","), multispace0)),
-    )(input)?;
-
-    let is_primary_key = v.iter().any(|t| t.1 == "primary");
-
-    Ok((rem, (v[0].1, is_primary_key)))
-}
-
-fn all_columns(input: &str) -> IResult<&str, Vec<(&str, bool)>> {
-    let (rem, v) = many1(parse_column_name)(input)?;
-    Ok((rem, v))
-}
-
-fn parse_columns(input: &str) -> IResult<&str, Vec<(&str, bool)>> {
-    let (rem, _) = multispace0(input)?;
-    let (rem, v) = delimited(tag("("), all_columns, tag(")"))(rem)?;
-    let (rem, _) = multispace0(rem)?;
-
-    Ok((rem, v))
 }
 
 pub fn parse_create_table(sql: &str) -> IResult<&str, Parsed> {
@@ -97,7 +73,7 @@ pub fn parse_create_table(sql: &str) -> IResult<&str, Parsed> {
     let (rem, _) = space1(rem)?;
     let (rem, _) = tag_no_case("TABLE")(rem)?;
     let (rem, _) = space1(rem)?;
-    let (rem, table) = alpha1(rem)?;
+    let (rem, table) = parse_field(rem)?;
     let (rem, _) = multispace1(rem)?;
     let (rem, columns) = parse_columns(rem)?;
 
@@ -123,9 +99,66 @@ pub fn parse_create_table(sql: &str) -> IResult<&str, Parsed> {
     ))
 }
 
+fn parse_field(input: &str) -> IResult<&str, &str> {
+    let (rem, v) = alt((
+        delimited(
+            // field in quotes can contain space or _
+            char('"'),
+            take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == ' '),
+            char('"'),
+        ),
+        // regular field
+        take_while1(|c: char| c.is_alphanumeric() || c == '_'),
+    ))(input)?;
+
+    Ok((rem, v))
+}
+
+fn parse_column_name(input: &str) -> IResult<&str, (&str, bool)> {
+    let (rem, v) = terminated(
+        many1(tuple((multispace0, parse_field, multispace0))),
+        alt((tag(","), multispace0)),
+    )(input)?;
+
+    let is_primary_key = v.iter().any(|t| t.1 == "primary");
+
+    Ok((rem, (v[0].1, is_primary_key)))
+}
+
+fn all_columns(input: &str) -> IResult<&str, Vec<(&str, bool)>> {
+    let (rem, v) = many1(parse_column_name)(input)?;
+    Ok((rem, v))
+}
+
+fn parse_columns(input: &str) -> IResult<&str, Vec<(&str, bool)>> {
+    let (rem, _) = multispace0(input)?;
+    let (rem, v) = delimited(tag("("), all_columns, tag(")"))(rem)?;
+    let (rem, _) = multispace0(rem)?;
+
+    Ok((rem, v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_field() {
+        let sql = "name ,";
+        let o = parse_field(sql);
+        let o = o.unwrap();
+        assert_eq!(o, (" ,", "name"));
+
+        let sql = "year_founded2, another";
+        let o = parse_field(sql);
+        let o = o.unwrap();
+        assert_eq!(o, (", another", "year_founded2"));
+
+        let sql = "\"size range\" text";
+        let o = parse_field(sql);
+        let o = o.unwrap();
+        assert_eq!(o, (" text", "size range"));
+    }
 
     #[test]
     fn test_parse_sql_count_asterix_uppercase() {
@@ -238,10 +271,12 @@ mod tests {
 
     #[test]
     fn test_parse_sql_create_table() {
-        let sql = "\n CREATE TABLE apples
+        let sql = "\n CREATE TABLE companies2
 (
 	id integer primary key autoincrement,
 	name text,
+    year_produced text ,
+   \"size range\" text,
 	color text
 )
 ";
@@ -251,8 +286,14 @@ mod tests {
             c.1,
             Parsed {
                 command: ParsedCommand::Create(0),
-                columns: vec!["id".to_string(), "name".to_string(), "color".to_string()],
-                table: "apples".to_string(),
+                columns: vec![
+                    "id".to_string(),
+                    "name".to_string(),
+                    "year_produced".to_string(),
+                    "size range".to_string(),
+                    "color".to_string()
+                ],
+                table: "companies2".to_string(),
             },
         );
     }
