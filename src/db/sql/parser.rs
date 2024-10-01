@@ -2,9 +2,9 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, tag_no_case, take_while1},
     character::complete::{char, multispace0, multispace1, space0, space1},
-    combinator::opt,
+    combinator::{map, opt},
     multi::{many1, separated_list0},
-    sequence::{delimited, preceded, terminated, tuple},
+    sequence::{delimited, preceded, separated_pair, terminated, tuple},
     IResult,
 };
 
@@ -20,6 +20,13 @@ pub struct Parsed {
     pub command: ParsedCommand,
     pub columns: Vec<String>,
     pub table: String,
+    pub where_cond: Option<Condition>, // WHERE color = 'Yellow'
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Condition {
+    pub column: String,
+    pub value: String,
 }
 
 pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
@@ -53,12 +60,31 @@ pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
     let (rem, _) = space1(rem)?;
     let (rem, table) = terminated(parse_field, space0)(rem)?;
 
+    let mut where_cond = None;
+
+    let (rem, cond) = opt(map(
+        tuple((
+            tag_no_case("WHERE"),
+            space1,
+            separated_pair(parse_field, tuple((space0, tag("="), space0)), parse_field),
+        )),
+        |s| s.2,
+    ))(rem)?;
+
+    if let Some(cond) = cond {
+        where_cond = Some(Condition {
+            column: cond.0.to_string(),
+            value: cond.1.to_string(),
+        })
+    }
+
     Ok((
         rem,
         Parsed {
             command,
             columns,
             table: table.to_lowercase(),
+            where_cond,
         },
     ))
 }
@@ -99,6 +125,7 @@ pub fn parse_create_table(sql: &str) -> IResult<&str, Parsed> {
             command: ParsedCommand::Create(primary_key),
             columns,
             table: table.to_string(),
+            where_cond: None,
         },
     ))
 }
@@ -107,9 +134,9 @@ fn parse_field(input: &str) -> IResult<&str, &str> {
     let (rem, v) = alt((
         delimited(
             // field in quotes can contain space or _
-            char('"'),
+            alt((char('"'), char('\''))),
             take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == ' '),
-            char('"'),
+            alt((char('"'), char('\''))),
         ),
         // regular field
         take_while1(|c: char| c.is_alphanumeric() || c == '_'),
@@ -175,6 +202,7 @@ mod tests {
                 command: ParsedCommand::Count,
                 columns: vec!["*".to_string()],
                 table: "oranges".to_string(),
+                where_cond: None,
             }
         );
     }
@@ -190,6 +218,7 @@ mod tests {
                 command: ParsedCommand::Count,
                 columns: vec!["name".to_string()],
                 table: "oranges".to_string(),
+                where_cond: None,
             }
         );
     }
@@ -205,6 +234,7 @@ mod tests {
                 command: ParsedCommand::Select,
                 columns: vec!["name".to_string()],
                 table: "oranges".to_string(),
+                where_cond: None,
             }
         );
     }
@@ -220,6 +250,26 @@ mod tests {
                 command: ParsedCommand::Select,
                 columns: vec!["id".to_string(), "name".to_string(), "descr".to_string()],
                 table: "oranges".to_string(),
+                where_cond: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_sql_select_with_where_clause() {
+        let sql = "SELECT name, color FROM apples WHERE color = 'Yellow'";
+        let c = parse_select(sql);
+        let c = c.unwrap();
+        assert_eq!(
+            c.1,
+            Parsed {
+                command: ParsedCommand::Select,
+                columns: vec!["name".to_string(), "color".to_string()],
+                table: "apples".to_string(),
+                where_cond: Some(Condition {
+                    column: "color".to_string(),
+                    value: "Yellow".to_string()
+                }),
             }
         );
     }
@@ -235,6 +285,7 @@ mod tests {
                 command: ParsedCommand::Select,
                 columns: vec!["*".to_string()],
                 table: "oranges".to_string(),
+                where_cond: None,
             }
         );
     }
@@ -313,6 +364,7 @@ mod tests {
                     "color".to_string()
                 ],
                 table: "companies2".to_string(),
+                where_cond: None,
             },
         );
     }

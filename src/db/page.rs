@@ -3,8 +3,7 @@ use std::io::{Read, Seek};
 use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
 
-use super::schema::ColumnType;
-use crate::db::schema::varint;
+use crate::db::schema::{varint, ColumnType};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -138,7 +137,7 @@ impl Cell {
         let header_size = header_size as usize - 1; // minus first byte (as it is the header size)
 
         let mut offset: usize = 0;
-        let mut column_offsets = Vec::new();
+        let mut columns = Vec::new();
 
         let payload_length = payload.remaining();
 
@@ -155,13 +154,13 @@ impl Cell {
                 ColumnType::Null(v) => v,
             };
 
-            let rc = RecordColumn {
+            let col = RecordColumn {
                 offset,
                 typ: column_type,
                 val_len,
             };
 
-            column_offsets.push(rc);
+            columns.push(col);
 
             offset += val_len as usize;
         }
@@ -170,26 +169,27 @@ impl Cell {
         let record = Record {
             row_id,
             body: payload,
-            column_offsets,
+            columns,
         };
 
         Ok(Self { row_id, record })
     }
 
-    pub(crate) fn column(&mut self, column_index: u16, primary_key_column: u16) -> Result<String> {
-        let rc = self
+    /// Returns content of the column
+    pub(crate) fn column(&self, column_index: u16, primary_key_column: u16) -> Result<String> {
+        let col = self
             .record
-            .column_offsets
+            .columns
             .get(column_index as usize)
             .ok_or(anyhow!("column index {column_index} out of range"))?;
 
         let val = if column_index == primary_key_column {
             Ok(self.row_id.to_string())
         } else {
-            String::from_utf8(self.record.body[rc.offset..][..rc.val_len as usize].to_vec())
+            String::from_utf8(self.record.body[col.offset..][..col.val_len as usize].to_vec())
         };
 
-        let s = match rc.typ {
+        let s = match col.typ {
             ColumnType::Text(_) => val,
             ColumnType::Int(_) => val,
             ColumnType::Null(_) => Ok("null".to_string()),
@@ -206,7 +206,7 @@ impl Cell {
 struct Record {
     row_id: u64,
     body: Bytes,
-    column_offsets: Vec<RecordColumn>,
+    columns: Vec<RecordColumn>,
 }
 
 #[derive(Debug)]
