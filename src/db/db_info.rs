@@ -9,10 +9,14 @@ use crate::db::schema::{varint, ColumnType};
 #[derive(Debug)]
 pub(crate) struct DBInfo {
     pub page_size: u16,
+    pub read_format: u8,
+    pub write_format: u8,
     pub reserved_bytes: u8,
+    pub file_change_counter: u32,
     pub text_encoding: u32,
     pub n_pages: u32,
     pub n_freelist_pages: u32,
+    pub schema_cookie: u32,
     pub schema_format: u32,
     pub schemas: Vec<Schema>,
 }
@@ -35,28 +39,45 @@ impl DBInfo {
         // The page size is stored at the 16th byte offset, using 2 bytes in big-endian order
         let page_size = u16::from_be_bytes([file_header[16], file_header[17]]);
 
+        // File format write version. 1 for legacy; 2 for WAL.
+        let read_format = file_header[18];
+
+        // File format read version. 1 for legacy; 2 for WAL.
+        let write_format = file_header[19];
+
         // Bytes of unused "reserved" space at the end of each page. Usually 0.
         let reserved_bytes = file_header[20];
 
-        // The database text encoding. A value of 1 means UTF-8. A value of 2 means UTF-16le. A value of 3 means UTF-16be.
-        let text_encoding = u32::from_be_bytes(file_header[56..60].try_into()?);
-        anyhow::ensure!(text_encoding == 1, "Only UTF-8 encoding is supported");
+        //  File change counter.
+        let file_change_counter = u32::from_be_bytes(file_header[24..28].try_into()?);
 
         // Size of the database file in pages. The "in-header database size".
         let n_pages = u32::from_be_bytes(file_header[28..32].try_into()?);
 
         // Page number of the first freelist trunk page.
-        let n_freelist_pages = u32::from_be_bytes(file_header[32..36].try_into()?);
+        //let n_freelist_pages = u32::from_be_bytes(file_header[32..36].try_into()?);
+        let n_freelist_pages = u32::from_be_bytes(file_header[36..40].try_into()?);
+
+        // The schema cookie.
+        let schema_cookie = u32::from_be_bytes(file_header[40..44].try_into()?);
 
         // The schema format number. Supported schema formats are 1, 2, 3, and 4.
         let schema_format = u32::from_be_bytes(file_header[44..48].try_into()?);
 
+        // The database text encoding. A value of 1 means UTF-8. A value of 2 means UTF-16le. A value of 3 means UTF-16be.
+        let text_encoding = u32::from_be_bytes(file_header[56..60].try_into()?);
+        anyhow::ensure!(text_encoding == 1, "Only UTF-8 encoding is supported");
+
         let mut db_info = Self {
             page_size,
+            read_format,
+            write_format,
             reserved_bytes,
+            file_change_counter,
             text_encoding,
             n_pages,
             n_freelist_pages,
+            schema_cookie,
             schema_format,
             schemas: Vec::new(),
         };

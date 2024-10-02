@@ -32,12 +32,24 @@ impl DB {
         self.db_info.page_size
     }
 
+    pub fn read_format(&self) -> u8 {
+        self.db_info.read_format
+    }
+
+    pub fn write_format(&self) -> u8 {
+        self.db_info.write_format
+    }
+
     pub fn text_encoding(&self) -> u32 {
         self.db_info.text_encoding
     }
 
     pub fn reserved_bytes(&self) -> u8 {
         self.db_info.reserved_bytes
+    }
+
+    pub fn file_change_counter(&self) -> u32 {
+        self.db_info.file_change_counter
     }
 
     pub fn n_pages(&self) -> u32 {
@@ -48,15 +60,25 @@ impl DB {
         self.db_info.n_freelist_pages
     }
 
+    pub fn schema_cookie(&self) -> u32 {
+        self.db_info.schema_cookie
+    }
+
     pub fn schema_format(&self) -> u32 {
         self.db_info.schema_format
     }
 
-    pub fn table_names(&self) -> Vec<String> {
+    pub fn table_names(&self, include_internal: bool) -> Vec<String> {
         self.db_info
             .schemas(SchemaType::Table)
             .iter()
-            .filter(|&s| s.tbl_name != "sqlite_sequence") // sqlite_sequence is an internal object
+            .filter(|&s| {
+                if include_internal {
+                    true
+                } else {
+                    s.tbl_name != "sqlite_sequence"
+                }
+            }) // sqlite_sequence is an internal object
             .map(|&s| s.tbl_name.clone())
             .collect()
     }

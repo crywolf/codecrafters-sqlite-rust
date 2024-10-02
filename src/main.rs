@@ -18,14 +18,18 @@ fn main() -> Result<()> {
             let db = DB::new(&args[1]).context("open DB")?;
 
             println!("database page size:  {}", db.page_size());
+            println!("write format:        {}", db.write_format());
+            println!("read format:         {}", db.read_format());
             println!("reserved bytes:      {}", db.reserved_bytes());
+            println!("file change counter: {}", db.file_change_counter());
             println!("database page count: {}", db.n_pages());
             println!("freelist page count: {}", db.n_freelist_pages());
+            println!("schema cookie:       {}", db.schema_cookie());
             println!("schema format:       {}", db.schema_format());
 
             println!("text encoding:       {} (utf-8)", db.text_encoding());
 
-            println!("number of tables:    {}", db.table_names().len());
+            println!("number of tables:    {}", db.table_names(true).len());
             println!("number of indexes:   {}", db.index_names().len());
             println!("number of triggers:  {}", db.trigger_names().len());
             println!("number of views:     {}", db.view_names().len());
@@ -33,7 +37,7 @@ fn main() -> Result<()> {
         ".tables" => {
             let db = DB::new(&args[1]).context("open DB")?;
 
-            for name in db.table_names() {
+            for name in db.table_names(false) {
                 print!("{}   ", name);
             }
             println!();
