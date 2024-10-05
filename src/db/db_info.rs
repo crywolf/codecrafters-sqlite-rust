@@ -13,18 +13,21 @@ pub(crate) struct DBInfo {
     pub write_format: u8,
     pub reserved_bytes: u8,
     pub file_change_counter: u32,
-    pub text_encoding: u32,
     pub n_pages: u32,
     pub n_freelist_pages: u32,
     pub schema_cookie: u32,
     pub schema_format: u32,
+    pub text_encoding: u32,
+    pub default_cache_size: u32,
+    pub application_id: u32,
+    pub sqlite_version_number: u32,
     pub schemas: Vec<Schema>,
 }
 
 impl DBInfo {
-    pub(crate) fn new<T>(mut db_file: T) -> Result<Self>
+    pub(crate) fn new<T>(mut db_file: T) -> Result<(Self, T)>
     where
-        T: Read + std::os::unix::fs::FileExt,
+        T: Read + Seek,
     {
         // The first 100 bytes of the database file comprise the database file header.
         // https://www.sqlite.org/fileformat.html#the_database_header
@@ -64,9 +67,15 @@ impl DBInfo {
         // The schema format number. Supported schema formats are 1, 2, 3, and 4.
         let schema_format = u32::from_be_bytes(file_header[44..48].try_into()?);
 
+        let default_cache_size = u32::from_be_bytes(file_header[48..52].try_into()?);
+
         // The database text encoding. A value of 1 means UTF-8. A value of 2 means UTF-16le. A value of 3 means UTF-16be.
         let text_encoding = u32::from_be_bytes(file_header[56..60].try_into()?);
         anyhow::ensure!(text_encoding == 1, "Only UTF-8 encoding is supported");
+
+        let application_id = u32::from_be_bytes(file_header[68..72].try_into()?);
+
+        let sqlite_version_number = u32::from_be_bytes(file_header[96..100].try_into()?);
 
         let mut db_info = Self {
             page_size,
@@ -74,11 +83,14 @@ impl DBInfo {
             write_format,
             reserved_bytes,
             file_change_counter,
-            text_encoding,
             n_pages,
             n_freelist_pages,
             schema_cookie,
             schema_format,
+            default_cache_size,
+            text_encoding,
+            application_id,
+            sqlite_version_number,
             schemas: Vec::new(),
         };
 
@@ -118,18 +130,34 @@ impl DBInfo {
         // Let K be the number of cells on the btree. The cell pointer array consists of K 2-byte integer offsets to the cell contents.
         // The cell pointer array consists of K 2-byte integer offsets to the cell contents.
         let mut cell_pointers = vec![0; n_cells * 2];
-        db_file.read_exact(&mut cell_pointers)?;
+        db_file
+            .read_exact(&mut cell_pointers)
+            .context("read cell pointers")?;
 
         let mut previous_offset = page_size;
+
+        db_file
+            .seek_relative(
+                (page_size as usize - file_header.len() - page_header.len() - cell_pointers.len())
+                    as i64,
+            )
+            .context("move to the end of the page")?;
 
         for i_cell in 0..n_cells {
             let offset =
                 u16::from_be_bytes([cell_pointers[i_cell * 2], cell_pointers[i_cell * 2 + 1]]);
 
             let cell_size = (previous_offset - offset) as usize;
+
+            db_file
+                .seek_relative(-(cell_size as i64))
+                .context("move to the beginning of the cell")?;
+
             let mut cell = BytesMut::zeroed(cell_size);
 
-            db_file.read_exact_at(&mut cell, offset as u64)?;
+            db_file
+                .read_exact(&mut cell)
+                .context("read the cell content")?;
 
             // Size of the record (varint)
             let _payload_size =
@@ -193,10 +221,10 @@ impl DBInfo {
 
             db_info.schemas.push(schema);
 
-            previous_offset = offset;
+            previous_offset = offset + cell_size as u16;
         }
 
-        Ok(db_info)
+        Ok((db_info, db_file))
     }
 
     pub(crate) fn schemas(&self, schema_type: SchemaType) -> Vec<&Schema> {

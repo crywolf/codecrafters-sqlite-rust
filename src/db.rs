@@ -1,31 +1,29 @@
 mod db_info;
 mod page;
+mod pager;
 mod schema;
 mod sql;
 
+use std::fs::File;
 use std::path::Path;
-use std::{
-    fs::File,
-    io::{Seek, SeekFrom},
-};
 
 use anyhow::{anyhow, bail, Context, Result};
 
 use db_info::DBInfo;
-use page::Page;
+use pager::Pager;
 use schema::{Schema, SchemaType};
 
 #[derive(Debug)]
 pub struct DB {
-    file: File,
     db_info: DBInfo,
+    pager: Pager<File>,
 }
 
 impl DB {
     pub fn new(file: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(&file).context("open DB file")?;
-        let db_info = DBInfo::new(file.try_clone()?)?;
-        Ok(Self { file, db_info })
+        let (pager, db_info) = Pager::new(file)?;
+        Ok(Self { db_info, pager })
     }
 
     pub fn page_size(&self) -> u16 {
@@ -66,6 +64,17 @@ impl DB {
 
     pub fn schema_format(&self) -> u32 {
         self.db_info.schema_format
+    }
+    pub fn default_cache_size(&self) -> u32 {
+        self.db_info.default_cache_size
+    }
+
+    pub fn sqlite_version_number(&self) -> u32 {
+        self.db_info.sqlite_version_number
+    }
+
+    pub fn application_id(&self) -> u32 {
+        self.db_info.application_id
     }
 
     pub fn table_names(&self, include_internal: bool) -> Vec<String> {
@@ -117,38 +126,24 @@ impl DB {
         Ok(res)
     }
 
-    pub(crate) fn get_page(&mut self, table: &str) -> Result<Page> {
+    pub(crate) fn root_page_num(&self, table: &str) -> Result<u64> {
         let schema = self
             .schema(table)
             .ok_or_else(|| anyhow::anyhow!("No schema found for {}", table))?;
 
-        let (table_columns, primary_key_column) = self
-            .table_columns(table)
-            .with_context(|| format!("get schema columns for table {}", table))?;
-
-        let page_start = (schema.rootpage - 1) * self.page_size() as u64;
-
-        self.file
-            .seek(SeekFrom::Start(page_start))
-            .context("seek offset in the DB file")?;
-
-        Page::new(
-            self.file.try_clone()?,
-            self.page_size(),
-            table_columns,
-            primary_key_column,
-        )
+        Ok(schema.rootpage)
     }
 
-    pub(crate) fn table_columns(&self, tbl_name: &str) -> Result<(Vec<String>, u16)> {
+    pub(crate) fn table(&self, name: &str) -> Result<Table> {
         /* To extract data for a single column, you'll need to know the order of that column in the sequence.
         You'll need to parse the table's CREATE TABLE statement to do this. */
         let schema = self
-            .schema(tbl_name)
-            .ok_or(anyhow!("table {} does not exist", tbl_name))?;
+            .schema(name)
+            .ok_or(anyhow!("table {} does not exist", name))?;
 
         let cmd = sql::parse_command(&schema.sql).context("parse schema")?;
-        let (columns, primary_key_column) = match cmd {
+
+        let (columns, primary_key_column_index) = match cmd {
             sql::Command::Create {
                 columns,
                 primary_key,
@@ -157,14 +152,24 @@ impl DB {
             _ => bail!("Schema is broken"),
         };
 
-        Ok((columns, primary_key_column))
+        Ok(Table {
+            name: name.to_string(),
+            columns,
+            primary_key_column_index,
+        })
     }
 
-    pub(crate) fn schema(&self, tbl_name: &str) -> Option<Schema> {
+    pub(crate) fn schema(&self, table: &str) -> Option<Schema> {
         self.db_info
             .schemas
             .iter()
-            .find(|&s| s.tbl_name == tbl_name)
+            .find(|&s| s.tbl_name == table)
             .cloned()
     }
+}
+
+pub(crate) struct Table {
+    name: String,
+    columns: Vec<String>,
+    primary_key_column_index: u16,
 }

@@ -3,7 +3,7 @@ mod parser;
 use anyhow::{anyhow, bail, Context, Result};
 use nom::branch::alt;
 
-use crate::db::page::Page;
+use super::pager::Tree;
 use crate::db::DB;
 use parser::*;
 
@@ -84,36 +84,37 @@ impl Command {
     }
 
     pub fn execute(&self, db: &mut DB) -> Result<Vec<Vec<String>>> {
-        let page = db
-            .get_page(self.table())
-            .with_context(|| format!("get page for table {}", self.table()))?;
-
         match self {
             Command::Select {
                 columns,
                 where_cond,
                 ..
-            } => Ok(Self::select_columns(page, columns, where_cond)?),
-            Command::Count { .. } => Ok(Self::count(page)?),
+            } => Ok(Self::select_columns(db, columns, where_cond, self.table())?),
+            Command::Count { .. } => Ok(Self::count(db, self.table())?),
             Command::Create { .. } => unimplemented!("CREATE TABLE command is not implemented"),
         }
     }
 
     fn select_columns(
-        page: Page,
+        db: &mut DB,
         column_names: &[String],
         cond: &Option<Condition>,
+        table: &str,
     ) -> Result<Vec<Vec<String>>> {
         // SELECT name FROM apples"
         // SELECT id, name FROM apples"
         // SELECT * FROM apples"
 
+        let table = db
+            .table(table)
+            .with_context(|| format!("get schema columns for table {}", table))?;
+
         let mut col_indices = Vec::new();
 
         if column_names.len() == 1 && column_names.contains(&"*".to_string()) {
             // SELECT * FROM ... (all columns)
-            col_indices = page
-                .table_columns
+            col_indices = table
+                .columns
                 .iter()
                 .enumerate()
                 .map(|(i, _)| i as u16)
@@ -121,7 +122,7 @@ impl Command {
         } else {
             // Select only specified columns
             for col in column_names {
-                let Some(col_index) = page.table_columns.iter().position(|c| c == col) else {
+                let Some(col_index) = table.columns.iter().position(|c| c == col) else {
                     bail!("Error: column '{col}' is not in the table")
                 };
                 col_indices.push(col_index as u16);
@@ -130,27 +131,30 @@ impl Command {
 
         let mut result = Vec::new();
 
+        // WHERE condition
         let mut cond_column_index = None;
         let mut cond_column_value = String::new();
-
         if let Some(cond) = cond {
-            if let Some(col_cond) = page.table_columns.iter().position(|c| *c == cond.column) {
+            if let Some(col_cond) = table.columns.iter().position(|c| *c == cond.column) {
                 cond_column_index = Some(col_cond as u16);
                 cond_column_value = cond.value.to_lowercase();
             }
         }
 
-        for cell in page.cells.iter() {
+        let root_page = db.root_page_num(&table.name)?;
+        let mut tree = Tree::new(&mut db.pager);
+
+        for cell in tree.cells(root_page)? {
             if let Some(cond_column_index) = cond_column_index {
-                let val = cell.column(cond_column_index, page.primary_key_column)?;
-                if cond_column_value != val.to_lowercase() {
+                let record_val = cell.column(cond_column_index, table.primary_key_column_index)?;
+                if cond_column_value != record_val.to_lowercase() {
                     continue;
                 }
             }
 
             let mut row = Vec::new();
             for index in col_indices.iter() {
-                let s = cell.column(*index, page.primary_key_column)?;
+                let s = cell.column(*index, table.primary_key_column_index)?;
                 row.push(s);
             }
             result.push(row);
@@ -159,9 +163,19 @@ impl Command {
         Ok(result)
     }
 
-    fn count(page: Page) -> Result<Vec<Vec<String>>> {
+    fn count(db: &mut DB, table: &str) -> Result<Vec<Vec<String>>> {
         // "SELECT COUNT(*) FROM apples"
-        Ok(vec![vec![page.n_cells.to_string()]])
+
+        // TODO where clause
+
+        let table = db
+            .table(table)
+            .with_context(|| format!("get schema columns for table {}", table))?;
+
+        let root_page = db.root_page_num(&table.name)?;
+        let mut tree = Tree::new(&mut db.pager);
+
+        Ok(vec![vec![tree.cells(root_page)?.len().to_string()]])
     }
 }
 

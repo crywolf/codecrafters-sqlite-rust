@@ -26,8 +26,11 @@ fn main() -> Result<()> {
             println!("freelist page count: {}", db.n_freelist_pages());
             println!("schema cookie:       {}", db.schema_cookie());
             println!("schema format:       {}", db.schema_format());
+            println!("default cache size:  {}", db.default_cache_size());
 
             println!("text encoding:       {} (utf-8)", db.text_encoding());
+            println!("application id:      {}", db.application_id());
+            println!("software version:    {}", db.sqlite_version_number());
 
             println!("number of tables:    {}", db.table_names(true).len());
             println!("number of indexes:   {}", db.index_names().len());

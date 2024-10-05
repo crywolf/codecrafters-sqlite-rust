@@ -1,42 +1,58 @@
 use std::io::{Read, Seek};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::db::schema::{varint, ColumnType};
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum PageType {
+    TableInterior,
+    TableLeaf,
+    IndexInterior,
+    IndexLeaf,
+}
+
+impl TryFrom<u8> for PageType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            2 => Ok(Self::IndexInterior), // Index B-Tree Interior Cell (header 0x02)
+            5 => Ok(Self::TableInterior), // Table B-Tree Interior Cell (header 0x05)
+            10 => Ok(Self::IndexLeaf),    // Index B-Tree Leaf Cell (header 0x0a)
+            13 => Ok(Self::TableLeaf),    // ATable B-Tree Leaf Cell (header 0x0d):
+            _ => Err(anyhow!("Unknown page type: {}", value)),
+        }
+    }
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct Page {
     data_size: u16,
-    page_type: u8,
+    pub page_type: PageType,
     freeblocks: u16,
     pub n_cells: u16,
     content_start: u16,
     fragmented: u8,
-    pub primary_key_column: u16,
+    /// Only in Interior Pages: The page number of the "root" of the subtree
+    /// that contains records with keys greater than the largest key in the page.
+    pub rightmost_pointer: Option<u32>,
     cell_pointers: Vec<u8>,
-    pub table_columns: Vec<String>,
     pub cells: Vec<Cell>,
 }
 
 impl Page {
-    pub(crate) fn new(
-        mut db_file: impl Read + Seek,
-        page_size: u16,
-        table_columns: Vec<String>,
-        primary_key_column: u16,
-    ) -> Result<Self> {
+    pub(crate) fn load(db_file: &mut (impl Read + Seek), page_size: u16) -> Result<Self> {
+        // The b-tree page header is 8 bytes in size for leaf pages and 12 bytes for interior pages.
+        // https://www.sqlite.org/fileformat.html#b_tree_pages
         let mut page_header = [0; 8];
         db_file
             .read_exact(&mut page_header)
             .context("read page header (first 8 bytes)")?;
 
-        let page_type = page_header[0];
-        anyhow::ensure!(
-            page_type == 13, // A value of 13 (0x0d) means the page is a leaf table b-tree page.
-            "First page shoud be a leaf table b-tree page"
-        );
+        let page_type = page_header[0].try_into()?;
 
         // Start of the first freeblock on the page, or is zero if there are no freeblocks.
         let freeblocks = u16::from_be_bytes([page_header[1], page_header[2]]);
@@ -54,6 +70,23 @@ impl Page {
         // Number of fragmented free bytes within the cell content area
         let fragmented = page_header[7];
 
+        // The four-byte page number at offset 8 is the right-most pointer.
+        // This value appears in the header of interior b-tree pages only and is omitted from all other pages.
+        let mut rightmost_pointer = None;
+        let mut extra_header = [0; 4];
+
+        if page_type == PageType::TableInterior || page_type == PageType::IndexInterior {
+            db_file
+                .read_exact(&mut extra_header)
+                .context("read page header (extra 4 bytes in interior pages)")?;
+            rightmost_pointer = Some(u32::from_be_bytes(extra_header));
+        }
+
+        let page_header_len = match page_type {
+            PageType::TableInterior | PageType::IndexInterior => page_header.len() + 4,
+            _ => page_header.len(),
+        };
+
         // The cell pointer array of a b-tree page immediately follows the b-tree page header.
         // Let K be the number of cells on the btree. The cell pointer array consists of K 2-byte integer offsets to the cell contents.
         // The cell pointer array consists of K 2-byte integer offsets to the cell contents.
@@ -65,7 +98,7 @@ impl Page {
         let mut previous_offset = page_size;
 
         db_file
-            .seek_relative((page_size as usize - page_header.len() - cell_pointers.len()) as i64)
+            .seek_relative((page_size as usize - page_header_len - cell_pointers.len()) as i64)
             .context("move to the end of the page")?;
 
         let mut cells = Vec::new();
@@ -86,23 +119,47 @@ impl Page {
                 .read_exact(&mut cell)
                 .context("read the cell content")?;
 
-            // Size of the record (varint)
-            let payload_size =
-                varint(&mut cell).with_context(|| format!("get int from varint {:?}", cell))?;
+            let cell: Cell = match page_type {
+                PageType::TableLeaf => {
+                    // Size of the record (varint)
+                    let payload_size = varint(&mut cell)
+                        .with_context(|| format!("get int from varint {:?}", cell))?;
 
-            // rowid (varint)
-            let row_id = varint(&mut cell)
-                .with_context(|| format!("get int from varint {:?}", cell))?
-                as u64;
+                    // rowid (varint)
+                    let row_id = varint(&mut cell)
+                        .with_context(|| format!("get int from varint {:?}", cell))?
+                        as u64;
 
-            // discard unused cell content
-            // cell now contains only valid record content
-            cell.resize(payload_size as usize, 0);
+                    // discard unused cell content
+                    // cell now contains only valid record content
+                    cell.resize(payload_size as usize, 0);
 
-            let payload = Bytes::from(cell);
-            let c = Cell::new(row_id, payload).context("get a cell")?;
+                    let payload = Bytes::from(cell);
+                    TableLeafCell::new(row_id, payload)
+                        .context("get a TableLeafCell")?
+                        .into()
+                }
+                PageType::TableInterior => {
+                    let left_child_page = cell.get_u32();
+                    let key = varint(&mut cell)? as u64;
+                    TableInteriorCell::new(left_child_page, key).into()
+                }
+                PageType::IndexLeaf => {
+                    // Size of the payload (varint)
+                    let payload_size = varint(&mut cell)
+                        .with_context(|| format!("get int from varint {:?}", cell))?;
 
-            cells.push(c);
+                    // discard unused cell content
+                    // cell now contains only valid payload content
+                    cell.resize(payload_size as usize, 0);
+
+                    let payload = Bytes::from(cell);
+                    IndexLeafCell::new(payload).into()
+                }
+                _ => unimplemented!("page type: {:?}", page_type),
+            };
+
+            cells.push(cell);
 
             previous_offset = offset + cell_size as u16;
         }
@@ -114,21 +171,58 @@ impl Page {
             n_cells,
             content_start,
             fragmented,
-            primary_key_column,
+            rightmost_pointer,
             cell_pointers,
-            table_columns,
             cells,
         })
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct Cell {
+pub(crate) enum Cell {
+    TableLeaf(TableLeafCell),
+    TableInterior(TableInteriorCell),
+    IndexLeaf(IndexLeafCell),
+    // IndexInterior,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct TableInteriorCell {
+    /// The page number of the "root" page of a subtree that contains records with keys lower or equal to key.
+    pub left_child_page: u32,
+    /// Cells in interior pages are logically ordered by key in ascending order.
+    pub row_id: u64,
+}
+
+impl TableInteriorCell {
+    pub(crate) fn new(left_child_page: u32, row_id: u64) -> Self {
+        Self {
+            left_child_page,
+            row_id,
+        }
+    }
+}
+
+impl From<TableInteriorCell> for Cell {
+    fn from(cell: TableInteriorCell) -> Self {
+        Cell::TableInterior(cell)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TableLeafCell {
     row_id: u64,
     record: Record,
 }
 
-impl Cell {
+impl From<TableLeafCell> for Cell {
+    fn from(cell: TableLeafCell) -> Self {
+        Cell::TableLeaf(cell)
+    }
+}
+
+impl TableLeafCell {
     pub fn new(row_id: u64, mut payload: Bytes) -> Result<Self> {
         // Size of the record header (varint)
         let header_size = varint(&mut payload)
@@ -146,23 +240,16 @@ impl Cell {
             let column_type =
                 super::schema::column_type(&mut payload).context("get column type")?;
 
-            let val_len = match column_type {
-                ColumnType::Text(v) => v,
-                ColumnType::Int(v) => v,
-                ColumnType::Blob(v) => v,
-                ColumnType::Float(v) => v,
-                ColumnType::Null(v) => v,
-            };
+            let column_length = column_type.column_bytes_lenght();
 
             let col = RecordColumn {
                 offset,
                 typ: column_type,
-                val_len,
             };
 
             columns.push(col);
 
-            offset += val_len as usize;
+            offset += column_length as usize;
         }
 
         // What left in payload is recod body
@@ -177,25 +264,46 @@ impl Cell {
 
     /// Returns content of the column
     pub(crate) fn column(&self, column_index: u16, primary_key_column: u16) -> Result<String> {
+        if column_index == primary_key_column {
+            return Ok(self.row_id.to_string());
+        }
+
         let col = self
             .record
             .columns
             .get(column_index as usize)
             .ok_or(anyhow!("column index {column_index} out of range"))?;
 
-        let val = if column_index == primary_key_column {
-            Ok(self.row_id.to_string())
-        } else {
-            String::from_utf8(self.record.body[col.offset..][..col.val_len as usize].to_vec())
-        };
+        let column_type = &col.typ;
+        let column_length = column_type.column_bytes_lenght();
 
-        let s = match col.typ {
-            ColumnType::Text(_) => val,
-            ColumnType::Int(_) => val,
-            ColumnType::Null(_) => Ok("null".to_string()),
-            _ => unimplemented!(),
-        }
-        .context("transforming column value to string")?;
+        let column_bytes = &self.record.body[col.offset..][..column_length as usize];
+
+        let s = match column_type {
+            ColumnType::Text(_) => String::from_utf8_lossy(column_bytes).to_string(),
+            ColumnType::Int(int_len) => match int_len {
+                1 => i8::from_be_bytes(column_bytes.try_into()?).to_string(),
+                2 => i16::from_be_bytes(column_bytes.try_into()?).to_string(),
+                3 => {
+                    let mut alligned = vec![0u8; 1];
+                    alligned.extend_from_slice(column_bytes);
+                    i32::from_be_bytes(alligned.as_slice().try_into()?).to_string()
+                }
+                4 => i32::from_be_bytes(column_bytes.try_into()?).to_string(),
+                6 => {
+                    let mut alligned = vec![0u8; 2];
+                    alligned.extend_from_slice(column_bytes);
+                    i64::from_be_bytes(alligned.as_slice().try_into()?).to_string()
+                }
+
+                8 => i64::from_be_bytes(column_bytes.try_into()?).to_string(),
+                _ => bail!("Invalid INT column length: {:?} bytes", int_len),
+            },
+            ColumnType::Int0(_) => 0.to_string(),
+            ColumnType::Int1(_) => 1.to_string(),
+            ColumnType::Null(_) => "".to_string(),
+            _ => unimplemented!("column type: {:?}", column_type),
+        };
 
         Ok(s)
     }
@@ -213,5 +321,22 @@ struct Record {
 struct RecordColumn {
     offset: usize,
     typ: ColumnType,
-    val_len: u64,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct IndexLeafCell {
+    pub payload: Bytes,
+}
+
+impl IndexLeafCell {
+    pub(crate) fn new(payload: Bytes) -> Self {
+        Self { payload }
+    }
+}
+
+impl From<IndexLeafCell> for Cell {
+    fn from(cell: IndexLeafCell) -> Self {
+        Cell::IndexLeaf(cell)
+    }
 }

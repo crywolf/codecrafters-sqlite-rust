@@ -42,34 +42,53 @@ impl SchemaType {
 pub(crate) enum ColumnType {
     Text(u64),
     Int(u64),
+    Int0(u64),
+    Int1(u64),
     Blob(u64),
     Float(u64),
     Null(u64),
 }
 
+impl ColumnType {
+    pub(crate) fn column_bytes_lenght(&self) -> u64 {
+        let &val_len = match self {
+            ColumnType::Text(v) => v,
+            ColumnType::Int(v) => v,
+            ColumnType::Int0(v) => v,
+            ColumnType::Int1(v) => v,
+            ColumnType::Blob(v) => v,
+            ColumnType::Float(v) => v,
+            ColumnType::Null(v) => v,
+        };
+
+        val_len
+    }
+}
 pub(crate) fn column_type<T>(mut v: T) -> Result<ColumnType>
 where
     T: bytes::Buf + std::fmt::Debug,
 {
     let v = varint(&mut v).with_context(|| format!("get int from varint {:?}", v))? as u64;
-    let column_type = if v > 12 {
+    let column_type = if v == 0 {
+        ColumnType::Null(0)
+    } else if v < 5 {
+        ColumnType::Int(v)
+    } else if v == 5 {
+        ColumnType::Int(6)
+    } else if v == 6 {
+        ColumnType::Int(8)
+    } else if v == 7 {
+        ColumnType::Float(8)
+    } else if v == 8 {
+        ColumnType::Int0(0)
+    } else if v == 9 {
+        ColumnType::Int1(0)
+    } else if v > 12 {
         if v % 2 == 0 {
             ColumnType::Blob((v - 12) / 2) // BLOB: v = (n*2) + 12 => n = (v - 12) / 2
         } else {
             ColumnType::Text((v - 13) / 2) // TEXT: v = (n*2) + 13 => n = (v - 13) / 2
         }
-    } else if v < 7 {
-        if v == 5 {
-            ColumnType::Int(6)
-        } else if v == 6 {
-            ColumnType::Int(8)
-        } else {
-            ColumnType::Int(v)
-        }
-    } else if v == 7 {
-        ColumnType::Float(1)
-    } else if v == 0 {
-        ColumnType::Null(0)
     } else {
         bail!("invalid column serial type: {}", v)
     };
