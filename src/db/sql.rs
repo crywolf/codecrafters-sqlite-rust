@@ -3,18 +3,30 @@ mod parser;
 use anyhow::{anyhow, bail, Context, Result};
 use nom::branch::alt;
 
-use super::pager::Tree;
+use super::{
+    pager::{self, Tree},
+    schema::SchemaType,
+};
 use crate::db::DB;
 use parser::*;
 
 pub(crate) fn parse_command(sql: &str) -> Result<Command> {
-    let parsed = match alt((parse_select, parse_create_table))(sql) {
+    let parsed = match alt((parse_select, parse_create_table, parse_create_index))(sql) {
         Ok((_, parsed)) => parsed,
         Err(err) => bail!("Error parsing SQL: {:?}", err),
     };
 
     let columns = parsed.columns;
     let table = parsed.table;
+
+    let where_cond = if let Some(cond) = parsed.where_cond {
+        Some(Condition {
+            column: cond.column,
+            value: cond.value,
+        })
+    } else {
+        None
+    };
 
     let command = match parsed.command {
         ParsedCommand::Count => Command::Count {
@@ -23,27 +35,19 @@ pub(crate) fn parse_command(sql: &str) -> Result<Command> {
                 .first()
                 .ok_or(anyhow!("Count command is missing column field"))?
                 .to_string(),
+            where_cond,
         },
-        ParsedCommand::Select => {
-            let where_cond = if let Some(cond) = parsed.where_cond {
-                Some(Condition {
-                    column: cond.column,
-                    value: cond.value,
-                })
-            } else {
-                None
-            };
-            Command::Select {
-                columns,
-                table,
-                where_cond,
-            }
-        }
-        ParsedCommand::Create(pk) => Command::Create {
+        ParsedCommand::Select => Command::Select {
+            columns,
+            table,
+            where_cond,
+        },
+        ParsedCommand::CreateTable(pk) => Command::CreateTable {
             columns,
             table,
             primary_key: pk,
         },
+        ParsedCommand::CreateIndex => Command::CreateIndex { columns, table },
     };
 
     Ok(command)
@@ -51,11 +55,15 @@ pub(crate) fn parse_command(sql: &str) -> Result<Command> {
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
-    Create {
+    CreateTable {
         columns: Vec<String>,
         table: String,
         /// primary key column index
         primary_key: u16,
+    },
+    CreateIndex {
+        columns: Vec<String>,
+        table: String,
     },
     Select {
         columns: Vec<String>,
@@ -65,6 +73,7 @@ pub(crate) enum Command {
     Count {
         column: String,
         table: String,
+        where_cond: Option<Condition>, // WHERE color = 'Yellow'
     },
 }
 
@@ -79,7 +88,8 @@ impl Command {
         match &self {
             Command::Select { table, .. } => table,
             Command::Count { table, .. } => table,
-            Command::Create { table, .. } => table,
+            Command::CreateTable { table, .. } => table,
+            Command::CreateIndex { table, .. } => table,
         }
     }
 
@@ -90,8 +100,13 @@ impl Command {
                 where_cond,
                 ..
             } => Ok(Self::select_columns(db, columns, where_cond, self.table())?),
-            Command::Count { .. } => Ok(Self::count(db, self.table())?),
-            Command::Create { .. } => unimplemented!("CREATE TABLE command is not implemented"),
+            Command::Count { where_cond, .. } => Ok(Self::count(db, self.table(), where_cond)?),
+            Command::CreateTable { .. } => {
+                unimplemented!("CREATE TABLE command is not implemented")
+            }
+            Command::CreateIndex { .. } => {
+                unimplemented!("CREATE INDEX command is not implemented")
+            }
         }
     }
 
@@ -105,9 +120,10 @@ impl Command {
         // SELECT id, name FROM apples"
         // SELECT * FROM apples"
 
+        let tbl_name = table;
         let table = db
-            .table(table)
-            .with_context(|| format!("get schema columns for table {}", table))?;
+            .table(tbl_name)
+            .with_context(|| format!("get schema columns for table {}", tbl_name))?;
 
         let mut col_indices = Vec::new();
 
@@ -121,41 +137,46 @@ impl Command {
                 .collect();
         } else {
             // Select only specified columns
-            for col in column_names {
-                let Some(col_index) = table.columns.iter().position(|c| c == col) else {
-                    bail!("Error: column '{col}' is not in the table")
+            for col_name in column_names {
+                let Some(col_index) = table.columns.iter().position(|c| c == col_name) else {
+                    bail!("Error: column '{col_name}' is not in the table")
                 };
                 col_indices.push(col_index as u16);
             }
         }
 
-        let mut result = Vec::new();
-
         // WHERE condition
-        let mut cond_column_index = None;
-        let mut cond_column_value = String::new();
+        let mut filter = None;
         if let Some(cond) = cond {
-            if let Some(col_cond) = table.columns.iter().position(|c| *c == cond.column) {
-                cond_column_index = Some(col_cond as u16);
-                cond_column_value = cond.value.to_lowercase();
+            if let Some(cond_col_i) = table.columns.iter().position(|c| *c == cond.column) {
+                let mut index_root_page = None;
+
+                // get index schema if index exists
+                let index = db.index_on_column(tbl_name, &cond.column);
+
+                if let Some(index_schema) = index {
+                    index_root_page = Some(index_schema.rootpage);
+                }
+
+                filter = Some(pager::CellFilter::new(
+                    index_root_page,
+                    cond_col_i as u16,
+                    cond.value.to_lowercase(),
+                    table.primary_key_column_index,
+                ));
             }
         }
 
-        let root_page = db.root_page_num(&table.name)?;
+        let table_root_page = db.root_page_num(&table.name, SchemaType::Table)?;
+
         let mut tree = Tree::new(&mut db.pager);
 
-        for cell in tree.cells(root_page)? {
-            if let Some(cond_column_index) = cond_column_index {
-                let record_val = cell.column(cond_column_index, table.primary_key_column_index)?;
-                if cond_column_value != record_val.to_lowercase() {
-                    continue;
-                }
-            }
-
+        let mut result = Vec::new();
+        for cell in tree.cells(table_root_page, filter)? {
             let mut row = Vec::new();
             for index in col_indices.iter() {
                 let s = cell.column(*index, table.primary_key_column_index)?;
-                row.push(s);
+                row.push(s.to_string());
             }
             result.push(row);
         }
@@ -163,19 +184,43 @@ impl Command {
         Ok(result)
     }
 
-    fn count(db: &mut DB, table: &str) -> Result<Vec<Vec<String>>> {
+    fn count(db: &mut DB, table: &str, cond: &Option<Condition>) -> Result<Vec<Vec<String>>> {
         // "SELECT COUNT(*) FROM apples"
 
-        // TODO where clause
-
+        let tbl_name = table;
         let table = db
-            .table(table)
-            .with_context(|| format!("get schema columns for table {}", table))?;
+            .table(tbl_name)
+            .with_context(|| format!("get schema columns for table {}", tbl_name))?;
 
-        let root_page = db.root_page_num(&table.name)?;
+        // WHERE condition
+        let mut filter = None;
+        if let Some(cond) = cond {
+            if let Some(cond_col_i) = table.columns.iter().position(|c| *c == cond.column) {
+                let mut index_root_page = None;
+
+                // get index schema if index exists
+                let index = db.index_on_column(tbl_name, &cond.column);
+
+                if let Some(index_schema) = index {
+                    index_root_page = Some(index_schema.rootpage);
+                }
+
+                filter = Some(pager::CellFilter::new(
+                    index_root_page,
+                    cond_col_i as u16,
+                    cond.value.to_lowercase(),
+                    table.primary_key_column_index,
+                ));
+            }
+        }
+
+        let table_root_page = db.root_page_num(&table.name, SchemaType::Table)?;
         let mut tree = Tree::new(&mut db.pager);
 
-        Ok(vec![vec![tree.cells(root_page)?.len().to_string()]])
+        Ok(vec![vec![tree
+            .cells(table_root_page, filter)?
+            .len()
+            .to_string()]])
     }
 }
 
@@ -192,21 +237,26 @@ mod tests {
             c,
             Command::Count {
                 column: "*".to_string(),
-                table: "oranges".to_string()
+                table: "oranges".to_string(),
+                where_cond: None,
             }
         );
     }
 
     #[test]
     fn test_parse_count_lowercase() {
-        let sql = "select count(*) from oranges";
+        let sql = "select count(*) from oranges where color = 'Yellow'";
         let c = parse_command(sql);
         let c = c.unwrap();
         assert_eq!(
             c,
             Command::Count {
                 column: "*".to_string(),
-                table: "oranges".to_string()
+                table: "oranges".to_string(),
+                where_cond: Some(Condition {
+                    column: "color".to_string(),
+                    value: "Yellow".to_string(),
+                }),
             }
         );
     }
@@ -220,7 +270,8 @@ mod tests {
             c,
             Command::Count {
                 column: "name".to_string(),
-                table: "oranges".to_string()
+                table: "oranges".to_string(),
+                where_cond: None,
             }
         );
     }
@@ -287,4 +338,18 @@ mod tests {
             }
         );
     }
+}
+
+#[test]
+fn test_parse_create_index() {
+    let sql = "CREATE INDEX idx_companies_country\n\ton companies (country)";
+    let c = parse_command(sql);
+    let c = c.unwrap();
+    assert_eq!(
+        c,
+        Command::CreateIndex {
+            columns: vec!["country".to_string()],
+            table: "companies".to_string()
+        }
+    );
 }

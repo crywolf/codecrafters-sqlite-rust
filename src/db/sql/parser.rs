@@ -3,20 +3,21 @@ use nom::{
     bytes::complete::{tag, tag_no_case, take_while1},
     character::complete::{char, multispace0, multispace1, space0, space1},
     combinator::{map, opt},
-    multi::{many1, separated_list0},
+    multi::{many1, separated_list1},
     sequence::{delimited, preceded, separated_pair, terminated, tuple},
     IResult,
 };
 
 #[derive(Debug, PartialEq)]
-pub enum ParsedCommand {
+pub(super) enum ParsedCommand {
     Count,
     Select,
-    Create(u16), // parameter is primary key column index
+    CreateTable(u16), // parameter is primary key column index
+    CreateIndex,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Parsed {
+pub(super) struct Parsed {
     pub command: ParsedCommand,
     pub columns: Vec<String>,
     pub table: String,
@@ -24,12 +25,12 @@ pub struct Parsed {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Condition {
+pub(super) struct Condition {
     pub column: String,
     pub value: String,
 }
 
-pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
+pub(super) fn parse_select(sql: &str) -> IResult<&str, Parsed> {
     let (rem, _) = tag_no_case("SELECT")(sql)?;
     let (rem, _) = space1(rem)?;
 
@@ -49,7 +50,7 @@ pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
     } else {
         alt((
             many1(tag("*")),
-            separated_list0(tuple((space0, tag(","), space0)), parse_field),
+            separated_list1(tuple((space0, tag(","), space0)), parse_field),
         ))(rem)?
     };
 
@@ -89,7 +90,7 @@ pub fn parse_select(sql: &str) -> IResult<&str, Parsed> {
     ))
 }
 
-pub fn parse_create_table(sql: &str) -> IResult<&str, Parsed> {
+pub(super) fn parse_create_table(sql: &str) -> IResult<&str, Parsed> {
     /*
     CREATE TABLE apples
     (
@@ -122,7 +123,39 @@ pub fn parse_create_table(sql: &str) -> IResult<&str, Parsed> {
     Ok((
         rem,
         Parsed {
-            command: ParsedCommand::Create(primary_key),
+            command: ParsedCommand::CreateTable(primary_key),
+            columns,
+            table: table.to_string(),
+            where_cond: None,
+        },
+    ))
+}
+
+pub(super) fn parse_create_index(sql: &str) -> IResult<&str, Parsed> {
+    /* CREATE INDEX idx_companies_country on companies (country); */
+    let (rem, _) = multispace0(sql)?;
+    let (rem, _) = tag_no_case("CREATE")(rem)?;
+    let (rem, _) = space1(rem)?;
+    let (rem, _) = tag_no_case("INDEX")(rem)?;
+    let (rem, _) = space1(rem)?;
+    let (rem, _index_name) = parse_field(rem)?;
+    let (rem, _) = multispace1(rem)?;
+    let (rem, _) = tag_no_case("ON")(rem)?;
+    let (rem, _) = multispace1(rem)?;
+    let (rem, table) = parse_field(rem)?;
+    let (rem, _) = multispace1(rem)?;
+    let (rem, columns) = delimited(
+        tag("("),
+        separated_list1(tuple((space0, tag(","), space0)), parse_field),
+        tag(")"),
+    )(rem)?;
+
+    let columns = columns.into_iter().map(|s| s.to_string()).collect();
+
+    Ok((
+        rem,
+        Parsed {
+            command: ParsedCommand::CreateIndex,
             columns,
             table: table.to_string(),
             where_cond: None,
@@ -355,7 +388,7 @@ mod tests {
         assert_eq!(
             c.1,
             Parsed {
-                command: ParsedCommand::Create(0),
+                command: ParsedCommand::CreateTable(0),
                 columns: vec![
                     "id".to_string(),
                     "name".to_string(),
@@ -364,6 +397,37 @@ mod tests {
                     "color".to_string()
                 ],
                 table: "companies2".to_string(),
+                where_cond: None,
+            },
+        );
+    }
+
+    #[test]
+    fn test_parse_sql_create_index() {
+        let sql = "\n CREATE INDEX idx_companies_country\n\ton companies (country)
+        ";
+        let c = parse_create_index(sql);
+        let c = c.unwrap();
+        assert_eq!(
+            c.1,
+            Parsed {
+                command: ParsedCommand::CreateIndex,
+                columns: vec!["country".to_string()],
+                table: "companies".to_string(),
+                where_cond: None,
+            },
+        );
+
+        let sql = "\n CREATE INDEX idx_companies_country\n\ton companies_2 (name, country)
+        ";
+        let c = parse_create_index(sql);
+        let c = c.unwrap();
+        assert_eq!(
+            c.1,
+            Parsed {
+                command: ParsedCommand::CreateIndex,
+                columns: vec!["name".to_string(), "country".to_string()],
+                table: "companies_2".to_string(),
                 where_cond: None,
             },
         );

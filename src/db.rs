@@ -126,10 +126,10 @@ impl DB {
         Ok(res)
     }
 
-    pub(crate) fn root_page_num(&self, table: &str) -> Result<u64> {
+    pub(crate) fn root_page_num(&self, table: &str, schema_type: SchemaType) -> Result<u64> {
         let schema = self
-            .schema(table)
-            .ok_or_else(|| anyhow::anyhow!("No schema found for {}", table))?;
+            .schema(table, schema_type)
+            .ok_or_else(|| anyhow::anyhow!("No schema found for {}:{:?}", table, schema_type))?;
 
         Ok(schema.rootpage)
     }
@@ -138,18 +138,18 @@ impl DB {
         /* To extract data for a single column, you'll need to know the order of that column in the sequence.
         You'll need to parse the table's CREATE TABLE statement to do this. */
         let schema = self
-            .schema(name)
+            .schema(name, SchemaType::Table)
             .ok_or(anyhow!("table {} does not exist", name))?;
 
         let cmd = sql::parse_command(&schema.sql).context("parse schema")?;
 
         let (columns, primary_key_column_index) = match cmd {
-            sql::Command::Create {
+            sql::Command::CreateTable {
                 columns,
                 primary_key,
                 ..
             } => (columns, primary_key),
-            _ => bail!("Schema is broken"),
+            _ => bail!("Table schema is broken"),
         };
 
         Ok(Table {
@@ -159,12 +159,36 @@ impl DB {
         })
     }
 
-    pub(crate) fn schema(&self, table: &str) -> Option<Schema> {
+    pub(crate) fn schema(&self, table: &str, schema_type: SchemaType) -> Option<&Schema> {
         self.db_info
-            .schemas
+            .schemas(schema_type)
             .iter()
-            .find(|&s| s.tbl_name == table)
-            .cloned()
+            .find(|&s| s.tbl_name == table && s.typ == schema_type.to_string())
+            .copied()
+    }
+
+    pub(crate) fn indices(&self, table: &str) -> Vec<&Schema> {
+        self.db_info
+            .schemas(SchemaType::Index)
+            .iter()
+            .filter(|&&s| s.tbl_name == table && s.typ == SchemaType::Index.to_string())
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn index_on_column(&self, table: &str, column: &String) -> Option<&Schema> {
+        self.indices(table)
+            .iter()
+            .find(|&&s| {
+                sql::parse_command(&s.sql).map_or(false, |cmd| match cmd {
+                    sql::Command::CreateIndex { columns, .. } => {
+                        // we support only index on one column, but it could be easily extended
+                        columns.len() == 1 && columns.contains(column)
+                    }
+                    _ => false,
+                })
+            })
+            .copied()
     }
 }
 

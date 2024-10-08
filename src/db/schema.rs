@@ -18,7 +18,7 @@ pub(crate) struct Schema {
     pub sql: String,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum SchemaType {
     Table,
     Index,
@@ -26,8 +26,19 @@ pub(crate) enum SchemaType {
     Trigger,
 }
 
+impl std::fmt::Display for SchemaType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaType::Table => f.write_str("table"),
+            SchemaType::Index => f.write_str("index"),
+            SchemaType::View => f.write_str("view"),
+            SchemaType::Trigger => f.write_str("trigger"),
+        }
+    }
+}
+
 impl SchemaType {
-    pub(crate) fn from_str(s: &str) -> Result<SchemaType> {
+    pub fn from_str(s: &str) -> Result<SchemaType> {
         match s {
             "table" => Ok(SchemaType::Table),
             "index" => Ok(SchemaType::Index),
@@ -38,7 +49,7 @@ impl SchemaType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum ColumnType {
     Text(u64),
     Int(u64),
